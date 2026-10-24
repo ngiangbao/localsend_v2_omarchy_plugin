@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "id": "ngiangbao.localsend",
+  "name": "LocalSend",
+  "version": "0.1.0",
+  "author": "Giang Bao Nguyen",
+  "license": "MIT",
+  "description": "AirDrop-style LocalSend for the bar: a radar of nearby devices, a timed receive window, and send/receive without the LocalSend app.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "LocalSend",
+    "description": "Radar of nearby LocalSend devices, timed visibility, and file / clipboard sharing.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "windowMinutes": 10,
+      "deviceName": "",
+      "language": "Auto"
+    },
+    "schema": [
+      {
+        "key": "windowMinutes",
+        "type": "integer",
+        "label": "Visible for (minutes, 0 = until turned off)",
+        "min": 0,
+        "max": 120,
+        "step": 1,
+        "defaultValue": 10
+      },
+      {
+        "key": "deviceName",
+        "type": "string",
+        "label": "Device name (empty = hostname)",
+        "defaultValue": ""
+      },
+      {
+        "key": "language",
+        "type": "enum",
+        "label": "Language",
+        "options": [
+          "Auto",
+          "English",
+          "Tiếng Việt"
+        ],
+        "defaultValue": "Auto",
+        "description": "Auto follows the system locale."
+      }
+    ]
+  }
+}
