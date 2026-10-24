@@ -2,10 +2,12 @@
 """lsd -- a small LocalSend v2 peer for the ngiangbao.localsend bar widget.
 
 The widget runs this as a child process and talks to it in JSON lines:
-commands on stdin, events on stdout. It speaks LocalSend protocol v2
+commands on stdin, events on stdout. It speaks LocalSend protocol v2.2
 (https://github.com/localsend/protocol): multicast discovery on
 224.0.0.167:53317, and an HTTPS server on TCP 53317 for /register,
-/prepare-upload, /upload and /cancel.
+/prepare-upload, /upload and /cancel. Files carry a sha256 and their
+timestamps; a checksum mismatch is answered with 422 and retried, as in
+LocalSend 1.18.
 
 Visibility works like AirDrop's "Everyone for N minutes": while a receive
 window is open this peer answers announcements and accepts uploads; outside
@@ -30,19 +32,21 @@ import sys
 import threading
 import time
 import urllib.parse
+from datetime import datetime, timezone
 
-PORT = 53317
+PORT = int(os.environ.get("LSD_PORT") or 53317)
 GROUP = "224.0.0.167"
 API = "/api/localsend/v2"
-VERSION = "2.1"
+VERSION = "2.2"          # LocalSend protocol version; see upstream.json
+MAX_UPLOAD_ATTEMPTS = 3  # tries per file after a checksum mismatch (422)
 PEER_TTL = 30            # seconds a peer stays on the radar without being heard
 SCAN_EVERY = 4           # announce period while the radar is open
 RECEIVE_ANNOUNCE_EVERY = 10
 DECISION_TIMEOUT = 60    # how long a sender waits for Accept / Decline
 CHUNK = 256 * 1024
 
-DATA_DIR = os.path.join(os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")),
-                        "ngiangbao-localsend")
+DATA_DIR = os.environ.get("LSD_DATA_DIR") or os.path.join(
+    os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")), "ngiangbao-localsend")
 CERT = os.path.join(DATA_DIR, "cert.pem")
 KEY = os.path.join(DATA_DIR, "key.pem")
 
@@ -63,6 +67,8 @@ def log(msg):
 
 
 def downloads_dir():
+    if os.environ.get("LSD_DOWNLOAD_DIR"):
+        return os.environ["LSD_DOWNLOAD_DIR"]
     try:
         out = subprocess.run(["xdg-user-dir", "DOWNLOAD"], capture_output=True, text=True, timeout=3)
         path = out.stdout.strip()
@@ -127,6 +133,44 @@ def unique_path(path):
     return "%s (%d)%s" % (base, n, ext)
 
 
+def file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def file_metadata(path):
+    """LocalSend's optional per-file timestamps, as RFC 3339 strings."""
+    st = os.stat(path)
+
+    def fmt(t):
+        return datetime.fromtimestamp(t, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return {"modified": fmt(st.st_mtime), "accessed": fmt(st.st_atime)}
+
+
+def apply_metadata(path, meta):
+    """Give a received file the sender's timestamps, when it sent valid ones."""
+    if not isinstance(meta, dict):
+        return
+
+    def parse(v):
+        try:
+            return datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    modified, accessed = parse(meta.get("modified")), parse(meta.get("accessed"))
+    if modified is None and accessed is None:
+        return
+    try:
+        st = os.stat(path)
+        os.utime(path, (accessed if accessed is not None else st.st_atime,
+                        modified if modified is not None else st.st_mtime))
+    except (OSError, ValueError, OverflowError):
+        pass
+
+
 def notify(title, body):
     try:
         subprocess.Popen(["notify-send", "-a", "LocalSend", "-i", "folder-download", title, body],
@@ -145,6 +189,7 @@ STRINGS = {
         "pin": "A PIN is required",
         "error_code": "Error %d",
         "bad_answer": "Invalid response",
+        "checksum": "Checksum mismatch",
         "message_from": "Message from %s",
         "copied": "(copied to the clipboard)",
         "wants_to_send": "%s wants to send files",
@@ -161,6 +206,7 @@ STRINGS = {
         "pin": "Cần mã PIN",
         "error_code": "Lỗi %d",
         "bad_answer": "Phản hồi không hợp lệ",
+        "checksum": "Sai mã kiểm tra (checksum)",
         "message_from": "Tin nhắn từ %s",
         "copied": "(đã chép vào clipboard)",
         "wants_to_send": "%s muốn gửi tệp",
@@ -186,8 +232,10 @@ class Peer:
         self.model = info.get("deviceModel")
         self.type = info.get("deviceType") or "desktop"
         self.ip = ip
-        self.port = int(info.get("port") or PORT)
-        self.protocol = "http" if info.get("protocol") == "http" else "https"
+        # A /register response has no port or protocol: keep what we knew.
+        self.port = int(info.get("port") or getattr(self, "port", PORT))
+        protocol = info.get("protocol") or getattr(self, "protocol", "https")
+        self.protocol = "http" if protocol == "http" else "https"
         self.seen = time.time()
 
     def public(self):
@@ -210,6 +258,8 @@ class Incoming:
         self.total = sum(int(f.get("size") or 0) for f in files.values())
         self.done_bytes = 0
         self.remaining = set()
+        self.attempts = {}            # id -> uploads started
+        self.failed = set()
         self.saved = []
 
 
@@ -354,6 +404,9 @@ class Node:
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
+            # LocalSend 1.18+ receivers require mutual TLS: our certificate
+            # proves the fingerprint we claim in /register and /prepare-upload.
+            ctx.load_cert_chain(CERT, KEY)
             return http.client.HTTPSConnection(peer.ip, peer.port, timeout=timeout, context=ctx)
         return http.client.HTTPConnection(peer.ip, peer.port, timeout=timeout)
 
@@ -390,17 +443,26 @@ class Node:
         if not local:
             emit("transfer", dir="out", status="failed", message=tr("nothing_to_send"))
             return
-        for full, rel in local.items():
-            fid = secrets.token_hex(8)
-            files[fid] = {"id": fid, "fileName": rel, "size": os.path.getsize(full),
-                          "fileType": mimetypes.guess_type(full)[0] or "application/octet-stream",
-                          "_path": full}
-        total = sum(f["size"] for f in files.values())
         tid = secrets.token_hex(6)
         job = {"cancel": False, "session": None, "peer": peer}
         self.outgoing[tid] = job
-        base = {"id": tid, "dir": "out", "peer": peer.alias, "total": total, "count": len(files)}
+        sizes = {full: os.path.getsize(full) for full in local}
+        total = sum(sizes.values())
+        base = {"id": tid, "dir": "out", "peer": peer.alias, "total": total, "count": len(local)}
         emit("transfer", status="waiting", done=0, **base)
+        try:
+            for full, rel in local.items():
+                fid = secrets.token_hex(8)
+                files[fid] = {"id": fid, "fileName": rel, "size": sizes[full],
+                              "fileType": mimetypes.guess_type(full)[0] or "application/octet-stream",
+                              "sha256": file_sha256(full), "metadata": file_metadata(full),
+                              "_path": full}
+                if job["cancel"]:
+                    emit("transfer", status="cancelled", done=0, **base)
+                    return
+        except OSError as e:
+            emit("transfer", status="failed", done=0, message=str(e), **base)
+            return
         payload = {"info": self.info(), "files": {k: {x: y for x, y in v.items() if x != "_path"}
                                                    for k, v in files.items()}}
         try:
@@ -424,49 +486,62 @@ class Node:
             emit("transfer", status="failed", done=0, message=tr("bad_answer"), **base)
             return
         job["session"] = session
-        done = 0
-        last = 0
+        progress = {"done": 0, "last": 0}
         for fid, token in tokens.items():
             meta = files.get(fid)
             if not meta:
                 continue
             q = urllib.parse.urlencode({"sessionId": session, "fileId": fid, "token": token})
-            conn = self.connection(peer, 60)
+            start = progress["done"]
             try:
-                conn.putrequest("POST", API + "/upload?" + q)
-                conn.putheader("Content-Type", "application/octet-stream")
-                conn.putheader("Content-Length", str(meta["size"]))
-                conn.endheaders()
-                with open(meta["_path"], "rb") as fh:
-                    while True:
-                        if job["cancel"]:
-                            raise OSError("cancelled")
-                        chunk = fh.read(CHUNK)
-                        if not chunk:
-                            break
-                        conn.send(chunk)
-                        done += len(chunk)
-                        if time.time() - last > 0.2:
-                            last = time.time()
-                            emit("transfer", status="transferring", done=done, **base)
-                r = conn.getresponse()
-                r.read()
-                if r.status != 200:
-                    raise OSError("receiver answered %d" % r.status)
+                for attempt in range(1, MAX_UPLOAD_ATTEMPTS + 1):
+                    progress["done"] = start
+                    status = self.upload_file(peer, q, meta, job, progress, base)
+                    if status == 200:
+                        break
+                    if status != 422:
+                        raise OSError("receiver answered %d" % status)
+                    if attempt == MAX_UPLOAD_ATTEMPTS:
+                        raise OSError(tr("checksum"))
             except (OSError, http.client.HTTPException) as e:
                 if job["cancel"]:
-                    emit("transfer", status="cancelled", done=done, **base)
+                    emit("transfer", status="cancelled", done=progress["done"], **base)
                 else:
-                    emit("transfer", status="failed", done=done, message=str(e), **base)
+                    emit("transfer", status="failed", done=progress["done"], message=str(e), **base)
                     try:
                         self.request(peer, "POST", API + "/cancel?sessionId=" + urllib.parse.quote(session), timeout=3)
                     except (OSError, http.client.HTTPException):
                         pass
+                self.outgoing.pop(tid, None)
                 return
-            finally:
-                conn.close()
         emit("transfer", status="done", done=total, **base)
         self.outgoing.pop(tid, None)
+
+    def upload_file(self, peer, query, meta, job, progress, base):
+        """POST one file's bytes; returns the receiver's HTTP status."""
+        conn = self.connection(peer, 60)
+        try:
+            conn.putrequest("POST", API + "/upload?" + query)
+            conn.putheader("Content-Type", "application/octet-stream")
+            conn.putheader("Content-Length", str(meta["size"]))
+            conn.endheaders()
+            with open(meta["_path"], "rb") as fh:
+                while True:
+                    if job["cancel"]:
+                        raise OSError("cancelled")
+                    chunk = fh.read(CHUNK)
+                    if not chunk:
+                        break
+                    conn.send(chunk)
+                    progress["done"] += len(chunk)
+                    if time.time() - progress["last"] > 0.2:
+                        progress["last"] = time.time()
+                        emit("transfer", status="transferring", done=progress["done"], **base)
+            r = conn.getresponse()
+            r.read()
+            return r.status
+        finally:
+            conn.close()
 
     def send_text(self, fingerprint, text):
         """A message: one text/plain file whose preview carries the text."""
@@ -692,11 +767,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         meta = s.files[fid]
         rel = safe_relpath(meta.get("fileName"))
         if not rel:
+            self.give_up(node, s, fid)
             return self.reply(400, {"message": "Invalid file name"})
+        s.attempts[fid] = s.attempts.get(fid, 0) + 1
         dest = unique_path(os.path.join(node.download_dir, rel))
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         part = dest + ".part"
         digest = hashlib.sha256()
+        received = 0
         last = 0
         try:
             with open(part, "wb") as fh:
@@ -705,6 +783,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         raise OSError("cancelled")
                     fh.write(chunk)
                     digest.update(chunk)
+                    received += len(chunk)
                     s.done_bytes += len(chunk)
                     if time.time() - last > 0.2:
                         last = time.time()
@@ -716,23 +795,46 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 os.remove(part)
             except OSError:
                 pass
+            s.done_bytes -= received
+            self.give_up(node, s, fid)
             return self.reply(500, {"message": "Transfer failed"})
         want = meta.get("sha256")
         if want and str(want).lower() != digest.hexdigest():
             os.remove(part)
+            s.done_bytes -= received
+            # The sender may retry with the same token, a few times.
+            if s.attempts[fid] >= MAX_UPLOAD_ATTEMPTS:
+                self.give_up(node, s, fid)
             return self.reply(422, {"message": "Checksum mismatch"})
         os.replace(part, dest)
+        apply_metadata(dest, meta.get("metadata"))
         s.remaining.discard(fid)
         s.saved.append(dest)
         emit("received", path=dest, name=os.path.basename(dest), size=os.path.getsize(dest),
              peer=str(s.sender.get("alias") or ip), time=int(time.time()))
         self.reply(200)
-        if not s.remaining:
-            emit("transfer", id=s.id, dir="in", status="done", peer=str(s.sender.get("alias") or ip),
+        self.end_session(node, s)
+
+    def give_up(self, node, s, fid):
+        """A file that will not arrive; the session ends once nothing is left."""
+        s.remaining.discard(fid)
+        s.failed.add(fid)
+        self.end_session(node, s)
+
+    def end_session(self, node, s):
+        if s.remaining or node.session is not s:
+            return
+        node.session = None
+        peer = str(s.sender.get("alias") or s.ip)
+        if s.failed:
+            emit("transfer", id=s.id, dir="in", status="failed", peer=peer, done=s.done_bytes,
+                 total=s.total, count=len(s.files))
+        else:
+            emit("transfer", id=s.id, dir="in", status="done", peer=peer,
                  done=s.total, total=s.total, count=len(s.files))
+        if s.saved:
             names = ", ".join(os.path.basename(p) for p in s.saved[:3])
             notify(tr("received_n") % len(s.saved), names)
-            node.session = None
 
 
 class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):

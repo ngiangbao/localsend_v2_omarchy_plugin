@@ -130,6 +130,26 @@ Panel {
     clip.running = true
   }
 
+  // ---- self-update ---------------------------------------------------
+  // The plugin is a git checkout; `omarchy plugin update` fast-forwards it,
+  // validates it and reloads the shell. Upstream LocalSend changes reach it
+  // through this repository (see .github/workflows/upstream.yml). It runs
+  // detached because the reload it triggers replaces this widget.
+  readonly property bool autoUpdate: String(setting("autoUpdate", true)) !== "false"
+  readonly property bool busy: request !== null
+                              || (transfer !== null && (transfer.status === "waiting" || transfer.status === "transferring"))
+
+  function checkForUpdate() {
+    if (!autoUpdate) return
+    if (busy) { updateTimer.interval = 10 * 60 * 1000; updateTimer.restart(); return }
+    updateTimer.interval = 6 * 60 * 60 * 1000
+    Quickshell.execDetached(["bash", "-c",
+      "command -v omarchy-plugin-update >/dev/null || exit 0; "
+      + "out=$(omarchy-plugin-update \"$1\" --yes 2>&1) || exit 1; "
+      + "case $out in *Updated*) notify-send -a LocalSend -i software-update-available LocalSend \"$2\" ;; esac",
+      "lsd-update", moduleName, t("updated")])
+  }
+
   function formatSize(n) {
     n = Number(n || 0)
     if (n < 1024) return n + " B"
@@ -215,6 +235,14 @@ Panel {
 
   Timer { id: noticeTimer; interval: 4000; onTriggered: root.notice = "" }
   Timer { id: transferClear; interval: 4000; onTriggered: root.transfer = null }
+
+  Timer {
+    id: updateTimer
+    interval: 2 * 60 * 1000
+    repeat: true
+    running: root.autoUpdate
+    onTriggered: root.checkForUpdate()
+  }
 
   Process {
     id: picker

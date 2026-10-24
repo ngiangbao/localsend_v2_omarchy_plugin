@@ -49,7 +49,8 @@ var table = {
     received_header: "RECEIVED",
     openFolder: "Open folder",
     from: "from %1",
-    thisDevice: "This device: %1"
+    thisDevice: "This device: %1",
+    updated: "LocalSend widget updated to the latest version"
   },
   vi: {
     starting: "Đang khởi động…",
@@ -98,7 +99,8 @@ var table = {
     received_header: "ĐÃ NHẬN",
     openFolder: "Mở thư mục",
     from: "từ %1",
-    thisDevice: "Tên máy này: %1"
+    thisDevice: "Tên máy này: %1",
+    updated: "Widget LocalSend đã được cập nhật lên bản mới nhất"
   }
 }
 

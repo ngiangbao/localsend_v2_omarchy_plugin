@@ -1,0 +1,132 @@
+# Keeps the plugin in step with upstream LocalSend without manual upkeep.
+#
+# Every day: look up the latest LocalSend release and protocol spec. When
+# either changed, build that release's localsend-cli and run tests/interop.py
+# against it. If the plugin still interoperates, record the new upstream in
+# upstream.json and push to main; installed widgets then pull it on their
+# own (the widget's autoUpdate setting runs `omarchy plugin update`).
+# If the tests fail, or upstream moved to a newer protocol version than
+# bin/lsd.py speaks, an issue is opened instead and nothing is pushed.
+#
+# On pushes and pull requests the same tests run against the pinned release.
+name: Upstream LocalSend
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["bin/**", "tests/**", "tools/**", "upstream.json", ".github/workflows/upstream.yml"]
+  pull_request:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: upstream-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  interop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Look up upstream
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SCHEDULED: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+        run: |
+          if [ "$SCHEDULED" = "true" ]; then
+            python3 tools/check_upstream.py
+          else
+            python3 tools/check_upstream.py --pinned
+          fi
+
+      - name: Check out LocalSend ${{ steps.check.outputs.tag }}
+        if: steps.check.outputs.changed == 'true' || github.event_name != 'schedule'
+        uses: actions/checkout@v4
+        with:
+          repository: localsend/localsend
+          ref: ${{ steps.check.outputs.tag }}
+          path: upstream
+
+      - name: Cache the CLI build
+        if: steps.check.outputs.changed == 'true' || github.event_name != 'schedule'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            upstream/target
+          key: localsend-cli-${{ steps.check.outputs.tag }}
+
+      - name: Build localsend-cli
+        if: steps.check.outputs.changed == 'true' || github.event_name != 'schedule'
+        working-directory: upstream
+        run: cargo build --release --locked -p localsend-cli
+
+      - name: Interop tests
+        id: tests
+        if: steps.check.outputs.changed == 'true' || github.event_name != 'schedule'
+        env:
+          LOCALSEND_CLI: ${{ github.workspace }}/upstream/target/release/localsend-cli
+        run: |
+          python3 -m py_compile bin/lsd.py tools/check_upstream.py tests/interop.py
+          python3 tests/interop.py 2>&1 | tee interop.log
+
+      - name: Record the new upstream
+        if: >-
+          (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+          && steps.check.outputs.changed == 'true' && steps.check.outputs.needs_review != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 tools/check_upstream.py --write
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git add upstream.json
+          git diff --cached --quiet && exit 0
+          git commit -m "Tested against LocalSend ${{ steps.check.outputs.tag }}"
+          git push
+
+      - name: Ask for a review
+        if: >-
+          always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+          && steps.check.outputs.changed == 'true'
+          && (steps.check.outputs.needs_review == 'true' || steps.tests.outcome == 'failure')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPORT: ${{ steps.check.outputs.report }}
+          TAG: ${{ steps.check.outputs.tag }}
+          TESTS: ${{ steps.tests.outcome }}
+        run: |
+          title="Upstream LocalSend $TAG needs attention"
+          if gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number' | grep -q .; then
+            exit 0
+          fi
+          {
+            echo "The daily upstream check found a change it could not take on its own."
+            echo
+            echo "Interop tests: **$TESTS**"
+            echo
+            echo '```json'
+            echo "$REPORT"
+            echo '```'
+            if [ -f interop.log ]; then
+              echo
+              echo '<details><summary>tests/interop.py</summary>'
+              echo
+              echo '```'
+              tail -n 80 interop.log
+              echo '```'
+              echo '</details>'
+            fi
+            echo
+            echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } > body.md
+          gh issue create --title "$title" --body-file body.md
